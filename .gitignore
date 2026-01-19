@@ -1,0 +1,79 @@
+# Dependencies
+.venv/
+env/
+venv/
+ENV/
+__pycache__/
+*.pyc
+
+# Data (if needed for privacy)
+data/
+
+# Logs
+*.log
+logs/
+
+# Operating System
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+tmp/
+temp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+dists/
+*.egg-info/
+*.egg
+MANIFEST
+.coverage
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Local config
+config.local
+
+# IDE specific
+.vscode/
+.idea/
+*.swp
+*.swo
+
+tmp/
+temp/
+
+# Sensitive files
+secret_key.txt
+*.key
+*.pem
+*.crt
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Readme (if needed)
+Readme-M.md/

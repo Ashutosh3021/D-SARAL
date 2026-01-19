@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>D-SARAL - Data Cleaning & Analysis Tool</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Aboreto&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="main-header">
+            <div class="logo">
+                <div class="logo-icon"><i class="fas fa-chart-line"></i></div>
+                <h1>D-SARAL</h1>
+            </div>
+            <p class="tagline">Intelligent Data Cleaning & Analysis</p>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <div class="wizard-container">
+                <!-- Progress Indicator -->
+                <div class="progress-indicator">
+                    <div class="step-indicator active" data-step="1">
+                        <div class="step-number">1</div>
+                        <div class="step-label">File Type</div>
+                    </div>
+                    <div class="progress-line"></div>
+                    <div class="step-indicator" data-step="2">
+                        <div class="step-number">2</div>
+                        <div class="step-label">Upload Files</div>
+                    </div>
+                    <div class="progress-line"></div>
+                    <div class="step-indicator" data-step="3">
+                        <div class="step-number">3</div>
+                        <div class="step-label">Processing</div>
+                    </div>
+                    <div class="progress-line"></div>
+                    <div class="step-indicator" data-step="4">
+                        <div class="step-number">4</div>
+                        <div class="step-label">Results</div>
+                    </div>
+                </div>
+
+                <!-- Step 1: File Type Selection -->
+                <div id="step1" class="step active">
+                    <div class="step-header">
+                        <h2>Select File Type</h2>
+                        <p>Choose the type of files you want to analyze and clean</p>
+                    </div>
+                    
+                    <div class="file-type-grid">
+                        <div class="file-type-card" data-type="csv">
+                            <div class="card-icon">
+                                <i class="fas fa-file-csv"></i>
+                            </div>
+                            <h3>CSV Files</h3>
+                            <p>Comma-separated values for tabular data</p>
+                            <div class="card-footer">
+                                <span class="file-ext">.csv</span>
+                            </div>
+                        </div>
+                        
+                        <div class="file-type-card" data-type="json">
+                            <div class="card-icon">
+                                <i class="fas fa-file-code"></i>
+                            </div>
+                            <h3>JSON Files</h3>
+                            <p>JavaScript Object Notation for structured data</p>
+                            <div class="card-footer">
+                                <span class="file-ext">.json</span>
+                            </div>
+                        </div>
+                        
+                        <div class="file-type-card" data-type="txt">
+                            <div class="card-icon">
+                                <i class="fas fa-file-lines"></i>
+                            </div>
+                            <h3>Text Files</h3>
+                            <p>Plain text files with delimited data</p>
+                            <div class="card-footer">
+                                <span class="file-ext">.txt</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <button id="nextBtn1" class="btn btn-primary" disabled>
+                        Continue to Upload
+                        <i class="fas fa-arrow-right"></i>
+                    </button>
+                </div>
+
+                <!-- Step 2: File Upload -->
+                <div id="step2" class="step">
+                    <div class="step-header">
+                        <h2>Upload Your Files</h2>
+                        <p>Drag & drop or browse to upload your <span id="selectedFileType">CSV</span> files</p>
+                    </div>
+                    
+                    <div class="upload-area" id="uploadArea">
+                        <div class="upload-content">
+                            <div class="upload-icon">
+                                <i class="fas fa-cloud-upload-alt"></i>
+                            </div>
+                            <h3>Drop files here</h3>
+                            <p>or click to browse your computer</p>
+                            <p class="upload-hint">Supports multiple files and folders</p>
+                            
+                            <input type="file" id="fileInput" multiple style="display: none;">
+                            <button class="btn btn-secondary" id="browseBtn">
+                                <i class="fas fa-folder-open"></i>
+                                Browse Files
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <div class="file-preview" id="filePreview" style="display: none;">
+                        <h3>Selected Files</h3>
+                        <div class="file-list" id="fileList"></div>
+                    </div>
+                    
+                    <div class="step-actions">
+                        <button id="prevBtn2" class="btn btn-secondary">
+                            <i class="fas fa-arrow-left"></i>
+                            Previous
+                        </button>
+                        <button id="processBtn" class="btn btn-primary" disabled>
+                            <i class="fas fa-cogs"></i>
+                            Process Data
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Step 3: Processing -->
+                <div id="step3" class="step">
+                    <div class="step-header">
+                        <h2>Analyzing Your Data</h2>
+                        <p>We're processing your files and identifying data quality issues</p>
+                    </div>
+                    
+                    <div class="processing-content">
+                        <div class="spinner"></div>
+                        <div class="progress-container">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progressFill"></div>
+                            </div>
+                            <div class="progress-text" id="progressText">Initializing...</div>
+                        </div>
+                        
+                        <div class="status-messages" id="statusMessages">
+                            <div class="status-message">
+                                <i class="fas fa-info-circle"></i>
+                                <span>Preparing to analyze your data...</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Step 4: Results -->
+                <div id="step4" class="step">
+                    <div class="step-header">
+                        <h2>Cleaning Complete!</h2>
+                        <p>Your data has been successfully analyzed and cleaned</p>
+                    </div>
+                    
+                    <div class="results-summary">
+                        <div class="stats-grid">
+                            <div class="stat-card">
+                                <div class="stat-icon">
+                                    <i class="fas fa-file"></i>
+                                </div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="filesProcessed">0</div>
+                                    <div class="stat-label">Files Processed</div>
+                                </div>
+                            </div>
+                            
+                            <div class="stat-card">
+                                <div class="stat-icon">
+                                    <i class="fas fa-exclamation-triangle"></i>
+                                </div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="issuesFound">0</div>
+                                    <div class="stat-label">Issues Found</div>
+                                </div>
+                            </div>
+                            
+                            <div class="stat-card">
+                                <div class="stat-icon">
+                                    <i class="fas fa-chart-line"></i>
+                                </div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="dataQuality">0%</div>
+                                    <div class="stat-label">Data Quality</div>
+                                </div>
+                            </div>
+                            
+                            <div class="stat-card">
+                                <div class="stat-icon">
+                                    <i class="fas fa-database"></i>
+                                </div>
+                                <div class="stat-content">
+                                    <div class="stat-value" id="rowsProcessed">0</div>
+                                    <div class="stat-label">Rows Processed</div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div class="results-actions">
+                            <button class="btn btn-primary" id="downloadBtn">
+                                <i class="fas fa-download"></i>
+                                Download Cleaned Data
+                            </button>
+                            <button class="btn btn-secondary" id="viewReportBtn">
+                                <i class="fas fa-file-alt"></i>
+                                View Analysis Report
+                            </button>
+                        </div>
+                        
+                        <div class="analysis-preview" id="analysisPreview">
+                            <h3>Analysis Summary</h3>
+                            <div class="preview-content" id="previewContent">
+                                <p>Your analysis report will appear here...</p>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div class="step-actions">
+                        <button id="newAnalysisBtn" class="btn btn-secondary">
+                            <i class="fas fa-plus"></i>
+                            New Analysis
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Footer -->
+        <footer class="main-footer">
+            <p>© 2025 D-SARAL - Making Data Cleaning Simple & Intelligent</p>
+        </footer>
+    </div>
+
+    <!-- Modal for Report -->
+    <div class="modal" id="reportModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Data Quality Analysis Report</h2>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <pre id="reportContent"></pre>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
