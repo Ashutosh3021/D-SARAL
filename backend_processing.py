@@ -1,806 +1,682 @@
 """
-Backend Processing Module for D-SARAL Data Cleaning & Analysis Tool
-Contains all data processing logic, file handling, and cleaning pipeline implementation
+backend_processing.py  —  D-SARAL Production Data Cleaning Pipeline
+=====================================================================
+Output is fully ML / EDA ready.  A data scientist or ML engineer can
+take the cleaned CSV and go straight to feature engineering.
+
+Pipeline steps (apply_cleaning_techniques)
+-------------------------------------------
+ 1. Encoding & whitespace normalisation
+ 2. Placeholder  →  NaN  (20+ variants)
+ 3. Per-column type inference & auto-cast
+ 4. Smart missing-value imputation
+     • numeric  : median (<5 % missing) / mean (<30 %) / median (≥30 %)
+     • datetime : median date
+     • object   : mode  → fallback "UNKNOWN"
+     • drop col if >60 % missing
+ 5. Date standardisation  →  ISO 8601 (YYYY-MM-DD)
+ 6. Numeric-string normalisation  (strips $, commas; ALL object cols tried)
+ 7. Text-case standardisation  (title / lower by column semantics)
+ 8. Outlier capping  (IQR × 1.5 fences, skips ID/zip/phone/year cols)
+ 9. Domain validation & nullification  (age 0-120, email regex, phone basic)
+10. Exact duplicate removal
+11. Fuzzy near-duplicate flagging  (token_sort_ratio ≥ 92)
+12. Constant / near-constant column removal  (≥99.5 % single value)
+13. Column-name normalisation  (lowercase, spaces → underscores)
+14. Final type enforcement  (float→Int64 where safe)
 """
 
-import pandas as pd
-import numpy as np
 import glob
+import json
 import os
 import re
-from datetime import datetime
-from typing import Dict, List, Tuple, Any
 import warnings
-import json
-import tempfile
-from werkzeug.utils import secure_filename
+from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+from scipy import stats as scipy_stats
+from thefuzz import fuzz
 
 warnings.filterwarnings("ignore")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Tuneable constants
+# ──────────────────────────────────────────────────────────────────────────────
+PLACEHOLDER_VALUES: set = {
+    "n/a", "na", "null", "none", "nan", "empty", "missing", "unknown",
+    "undefined", "nil", "not available", "not applicable", "not disclosed",
+    "#n/a", "-", "--", "---", "?", ".", "0000-00-00", "1900-01-01",
+}
+
+DATE_OUTPUT_FORMAT       = "%Y-%m-%d"   # ISO 8601
+OUTLIER_IQR_MULTIPLIER   = 1.5
+OUTLIER_ZSCORE_THRESHOLD = 3.0
+FUZZY_DEDUP_THRESHOLD    = 92           # 0-100; lower = more aggressive
+NEAR_CONSTANT_THRESHOLD  = 0.995        # drop col if top value ≥ this fraction
+MISSING_DROP_THRESHOLD   = 0.60         # drop col if missing fraction > this
+
+_SKIP_OUTLIER_KW = ("id", "code", "zip", "postal", "phone", "mobile", "year",
+                    "flag", "bool", "index")
+_DATE_KW         = ("date", "time", "dob", "birth", "created", "updated",
+                    "modified", "timestamp", "at")
+_NUMERIC_KW      = ("salary", "income", "price", "amount", "cost", "revenue",
+                    "fee", "wage", "rate", "balance", "total", "count",
+                    "score", "mark", "grade", "rating", "quantity", "qty",
+                    "weight", "height", "distance", "age", "year")
+_TITLE_KW        = ("name", "department", "dept", "category", "type",
+                    "status", "gender", "sex", "city", "country", "state",
+                    "region", "district", "title", "role", "position",
+                    "occupation", "subject")
+_LOWER_KW        = ("email", "url", "website", "domain", "username", "user",
+                    "login", "handle", "slug")
+_PHONE_PATTERN   = re.compile(r"^\+?[\d\s\-().]{7,15}$")
+_EMAIL_PATTERN   = re.compile(
+    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 class DataProcessingPipeline:
-    """
-    Main class for data processing pipeline in D-SARAL
-    Handles loading, analyzing, cleaning, and validating data
-    """
-    
-    def __init__(self, sample_size: int = 10000):
-        """
-        Initialize the data processing pipeline
-        
-        Args:
-            sample_size: Number of rows to sample from large files for analysis
-        """
-        self.sample_size = sample_size
-        self.current_dataframes = {}
-        self.analysis_report = {}
-        self.cleaning_log = []
-        self.processed_data = None
-        
-    def load_files_from_directory(self, data_directory: str, file_types: list = None) -> Dict[str, pd.DataFrame]:
-        """
-        Load all supported files from the specified directory
-        
-        Args:
-            data_directory: Path to the directory containing files
-            file_types: List of file extensions to load (e.g., ['csv', 'json'])
-            
-        Returns:
-            Dictionary mapping file paths to loaded DataFrames
-        """
+    """Production-grade data cleaning pipeline for D-SARAL."""
+
+    def __init__(self, sample_size: int = 10_000):
+        self.sample_size         = sample_size
+        self.current_dataframes: Dict[str, pd.DataFrame] = {}
+        self.analysis_report:    Dict[str, Any]          = {}
+        self.cleaning_log:       List[Dict]              = []
+        self.processed_data:     Optional[pd.DataFrame]  = None
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 1. File loading
+    # ──────────────────────────────────────────────────────────────────────────
+    def load_files_from_directory(
+        self,
+        data_directory: str,
+        file_types: Optional[List[str]] = None,
+    ) -> Dict[str, pd.DataFrame]:
+        """Load every supported file under *data_directory*."""
         if file_types is None:
-            file_types = ['csv', 'json', 'txt']
-        
+            file_types = ["csv", "json", "txt"]
+
         self.current_dataframes = {}
-        
-        # Find all supported files recursively
+
         for ext in file_types:
-            pattern = f"*.{ext}"
-            files = glob.glob(os.path.join(data_directory, "**", pattern), recursive=True)
-            
-            for file_path in files:
+            for fp in glob.glob(
+                os.path.join(data_directory, "**", f"*.{ext}"), recursive=True
+            ):
                 try:
-                    if ext.lower() == 'csv':
-                        df = pd.read_csv(file_path, nrows=self.sample_size if os.path.getsize(file_path) > 1000000 else None)
-                    elif ext.lower() == 'json':
-                        df = pd.read_json(file_path, nrows=self.sample_size if os.path.getsize(file_path) > 1000000 else None)
-                    elif ext.lower() == 'txt':
-                        # Try to infer delimiter
-                        if os.path.getsize(file_path) > 1000000:
-                            # For large files, read a sample first to infer the delimiter, then apply nrows
-                            sample_df = pd.read_csv(file_path, sep=None, engine='python', on_bad_lines='skip', nrows=self.sample_size)
-                            df = sample_df  # Just use the sample for now
-                        else:
-                            df = pd.read_csv(file_path, sep=None, engine='python', on_bad_lines='skip')
+                    large  = os.path.getsize(fp) > 1_000_000
+                    nrows  = self.sample_size if large else None
+                    ext_lc = ext.lower()
+
+                    if ext_lc == "csv":
+                        df = pd.read_csv(
+                            fp, nrows=nrows, encoding="utf-8",
+                            on_bad_lines="skip", low_memory=False,
+                        )
+                    elif ext_lc == "json":
+                        df = pd.read_json(fp)
+                        if large:
+                            df = df.head(self.sample_size)
+                    elif ext_lc == "txt":
+                        df = pd.read_csv(
+                            fp, sep=None, engine="python",
+                            on_bad_lines="skip", nrows=nrows,
+                        )
                     else:
                         continue
-                        
-                    self.current_dataframes[file_path] = df
-                except Exception as e:
-                    print(f"Error loading {file_path}: {str(e)}")
-        
+
+                    self.current_dataframes[fp] = df
+                except Exception as exc:
+                    print(f"[LOAD ERROR] {fp}: {exc}")
+
         return self.current_dataframes
-    
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 2. Analysis helpers
+    # ──────────────────────────────────────────────────────────────────────────
     def analyze_missing_values(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Analyze missing values in the dataframe efficiently
-        
-        Args:
-            df: DataFrame to analyze
-            
-        Returns:
-            Dictionary with missing value analysis
-        """
-        missing_analysis = {}
-        
-        # Standard NaN values
-        standard_nans = df.isnull().sum()
-        missing_analysis["standard_nan_counts"] = standard_nans[standard_nans > 0].to_dict()
-        
-        # Empty strings
-        empty_strings = df.apply(lambda col: col.astype(str).str.strip().eq("").sum())
-        missing_analysis["empty_string_counts"] = empty_strings[empty_strings > 0].to_dict()
-        
-        # Placeholder values that indicate missing data
-        placeholder_patterns = ["N/A", "NA", "NULL", "null", "nan", "NaN", "None", "empty", "missing", "Unknown", "unknown"]
-        placeholder_counts = {}
-        
-        for col in df.columns:
-            placeholder_count = 0
-            # Process in chunks to avoid memory issues with large datasets
-            chunk_size = min(5000, len(df))
-            for i in range(0, len(df), chunk_size):
-                chunk = df[col].iloc[i:i+chunk_size]
-                for pattern in placeholder_patterns:
-                    mask = chunk.astype(str).str.lower() == pattern.lower()
-                    placeholder_count += mask.sum()
-            
-            if placeholder_count > 0:
-                placeholder_counts[col] = placeholder_count
-        
-        missing_analysis["placeholder_counts"] = placeholder_counts
-        
-        # Total missing values per column
-        total_missing = {}
-        for col in df.columns:
-            total = 0
-            # Count standard NaNs
-            total += df[col].isnull().sum()
-            # Count empty strings
-            total += df[col].astype(str).str.strip().eq("").sum()
-            # Count placeholders in chunks
-            for i in range(0, len(df), chunk_size):
-                chunk = df[col].iloc[i:i+chunk_size]
-                for pattern in placeholder_patterns:
-                    total += (chunk.astype(str).str.lower() == pattern.lower()).sum()
-            
-            if total > 0:
-                total_missing[col] = total
-        
-        missing_analysis["total_missing_per_column"] = total_missing
-        
-        return missing_analysis
-    
-    def analyze_format_inconsistencies(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Analyze inconsistent formats in the dataframe efficiently
-        
-        Args:
-            df: DataFrame to analyze
-            
-        Returns:
-            Dictionary with format inconsistency analysis
-        """
-        format_analysis = {}
-        chunk_size = min(5000, len(df))  # Process in chunks
-        
-        for col in df.columns:
-            series = df[col]
-            
-            # Check for mixed data types (sample for large datasets)
-            if len(series) > chunk_size:
-                sampled_series = series.sample(min(chunk_size, len(series)), random_state=42)
-            else:
-                sampled_series = series
-            
-            unique_types = set()
-            for val in sampled_series.dropna():
-                unique_types.add(type(val).__name__)
-            
-            if len(unique_types) > 1:
-                format_analysis[f"{col}_mixed_types"] = list(unique_types)
-            
-            # Check for inconsistent date formats
-            if "date" in col.lower() or "birth" in col.lower() or "time" in col.lower():
-                date_formats = set()
-                valid_dates = 0
-                
-                # Sample data for processing large datasets
-                if len(series) > chunk_size:
-                    date_sample = series.dropna().sample(min(chunk_size, len(series.dropna())), random_state=42)
-                else:
-                    date_sample = series.dropna()
-                
-                for val in date_sample:
-                    try:
-                        parsed_date = pd.to_datetime(val, errors="coerce")
-                        if pd.notna(parsed_date):
-                            valid_dates += 1
-                            # Try to detect common formats
-                            if isinstance(val, str):
-                                if "/" in val:
-                                    date_formats.add("MM/DD/YYYY or DD/MM/YYYY")
-                                elif "-" in val:
-                                    date_formats.add("YYYY-MM-DD or MM-DD-YYYY")
-                                elif re.match(r"\d{1,2}/\d{1,2}/\d{4}", val):
-                                    date_formats.add("MM/DD/YYYY")
-                                elif re.match(r"\d{4}-\d{2}-\d{2}", val):
-                                    date_formats.add("YYYY-MM-DD")
-                                elif re.match(r"\d{1,2}-\d{1,2}-\d{4}", val):
-                                    date_formats.add("MM-DD-YYYY")
-                    
-                    except:
-                        continue
-                
-                if len(date_formats) > 1:
-                    format_analysis[f"{col}_multiple_date_formats"] = list(date_formats)
-            
-            # Check for inconsistent number formats (with currency symbols, commas, etc.) - sample for large datasets
-            if len(series) > chunk_size:
-                numeric_sample = series.dropna().sample(min(chunk_size, len(series.dropna())), random_state=42)
-            else:
-                numeric_sample = series.dropna()
-            
-            numeric_like = numeric_sample.apply(lambda x: str(x)).astype(str)
-            numeric_patterns = []
-            
-            for val in numeric_like:
-                if pd.api.types.is_numeric_dtype(series.dtype):
-                    continue
-                elif re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d+)?$", val):  # Matches $1,000.00 or 1,000.00
-                    numeric_patterns.append("formatted_number_with_commas")
-                elif re.match(r"^\$\d+(\.\d+)?$", val):  # Matches $50000
-                    numeric_patterns.append("currency_format")
-                elif re.match(r"^\d+$", val):  # Matches 50000
-                    numeric_patterns.append("plain_number")
-                elif re.match(r"^\d+\.\d+$", val):  # Matches 50000.00
-                    numeric_patterns.append("decimal_number")
-            
-            if len(set(numeric_patterns)) > 1:
-                format_analysis[f"{col}_multiple_numeric_formats"] = list(set(numeric_patterns))
-        
-        return format_analysis
-    
-    def analyze_broken_entries(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Analyze broken entries in the dataframe (impossible values, etc.) efficiently
-        
-        Args:
-            df: DataFrame to analyze
-            
-        Returns:
-            Dictionary with broken entry analysis
-        """
-        broken_analysis = {}
-        chunk_size = min(5000, len(df))  # Process in chunks
-        
-        for col in df.columns:
-            series = df[col]
-            
-            # Check for impossible age values
-            if "age" in col.lower():
-                # Convert to numeric, coercing errors to NaN
-                numeric_series = pd.to_numeric(series, errors="coerce")
-                invalid_ages = numeric_series[(numeric_series < 0) | (numeric_series > 150)]
-                
-                if len(invalid_ages) > 0:
-                    # Limit results for large datasets
-                    sample_invalid = invalid_ages.dropna().head(100) if len(invalid_ages) > 100 else invalid_ages.dropna()
-                    broken_analysis[f"{col}_invalid_ages"] = {
-                        "count": len(invalid_ages),
-                        "values": sample_invalid.tolist(),
-                        "indices": sample_invalid.index.tolist()
-                    }
-            
-            # Check for invalid email formats
-            if "email" in col.lower():
-                # Process in chunks for large datasets
-                invalid_emails_list = []
-                invalid_indices_list = []
-                
-                for i in range(0, len(series), chunk_size):
-                    chunk = series.iloc[i:i+chunk_size]
-                    email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-                    chunk_invalid_emails = chunk[~chunk.astype(str).str.contains(email_pattern, na=False)]
-                    
-                    invalid_emails_list.extend(chunk_invalid_emails.tolist())
-                    invalid_indices_list.extend(chunk_invalid_emails.index.tolist())
-                    
-                    # Limit results for reporting
-                    if len(invalid_emails_list) > 100:
-                        break
-                
-                if len(invalid_emails_list) > 0:
-                    broken_analysis[f"{col}_invalid_emails"] = {
-                        "count": min(len(invalid_emails_list), 100),
-                        "values": invalid_emails_list[:100],
-                        "indices": invalid_indices_list[:100]
-                    }
-            
-            # Check for impossible date values
-            if "date" in col.lower() or "birth" in col.lower():
-                # Try to parse dates and check for impossible values
-                parsed_dates = pd.to_datetime(series, errors="coerce")
-                invalid_dates = parsed_dates[pd.isna(parsed_dates) & pd.notna(series)]
-                
-                if len(invalid_dates) > 0:
-                    # Limit results for large datasets
-                    sample_invalid = invalid_dates.head(100) if len(invalid_dates) > 100 else invalid_dates
-                    broken_analysis[f"{col}_invalid_dates"] = {
-                        "count": len(invalid_dates),
-                        "values": series[pd.isna(parsed_dates) & pd.notna(series)].head(100).tolist(),
-                        "indices": sample_invalid.index.tolist()
-                    }
-                
-                # Check for future dates in birth columns
-                if "birth" in col.lower():
-                    future_births = parsed_dates[parsed_dates > datetime.now()]
-                    if len(future_births) > 0:
-                        # Limit results for large datasets
-                        sample_future = future_births.head(100) if len(future_births) > 100 else future_births
-                        broken_analysis[f"{col}_future_birth_dates"] = {
-                            "count": len(future_births),
-                            "values": sample_future.dropna().dt.strftime("%Y-%m-%d").tolist(),
-                            "indices": sample_future.dropna().index.tolist()
-                        }
-        
-        return broken_analysis
-    
-    def analyze_duplicates(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Analyze duplicate records in the dataframe efficiently
-        
-        Args:
-            df: DataFrame to analyze
-            
-        Returns:
-            Dictionary with duplicate analysis
-        """
-        duplicate_analysis = {}
-        
-        # Overall duplicates - sample if dataset is too large
-        if len(df) > 50000:  # For very large datasets, use sampling approach
-            # Take a sample to estimate duplicates
-            sample_size = min(10000, len(df))
-            sample_df = df.sample(n=sample_size, random_state=42)
-            total_duplicates = int((sample_df.duplicated().sum() / sample_size) * len(df))
-            duplicate_analysis["total_row_duplicates"] = total_duplicates
-            duplicate_analysis["estimated_from_sample"] = True
-            
-            # Get actual duplicate indices from a smaller sample for examples
-            actual_duplicates = df.head(5000).duplicated(keep=False)
-            duplicate_indices = df.head(5000)[actual_duplicates].index.tolist()
-            duplicate_analysis["duplicate_row_indices"] = duplicate_indices[:10]  # Limit to first 10 for brevity
-        else:
-            # For smaller datasets, analyze completely
-            total_duplicates = df.duplicated().sum()
-            duplicate_analysis["total_row_duplicates"] = total_duplicates
-            duplicate_analysis["estimated_from_sample"] = False
-            
-            if total_duplicates > 0:
-                duplicate_indices = df[df.duplicated(keep=False)].index.tolist()
-                duplicate_analysis["duplicate_row_indices"] = duplicate_indices[:10]  # Limit to first 10 for brevity
-        
-        # Check for near-duplicates based on specific columns that should be unique
-        likely_unique_cols = []
-        
-        # Heuristic: columns with 'id', 'email', 'name' might be expected to be unique
-        for col in df.columns:
-            if any(keyword in col.lower() for keyword in ["id", "email", "name"]):
-                # For large datasets, sample the column duplicate analysis
-                if len(df) > 25000:
-                    sample_col_df = df[[col]].sample(n=min(25000, len(df)), random_state=42)
-                    col_duplicates = sample_col_df[sample_col_df.duplicated(subset=[col], keep=False)][col].value_counts()
-                else:
-                    col_duplicates = df[df.duplicated(subset=[col], keep=False)][col].value_counts()
-                
-                if len(col_duplicates) > 0:
-                    likely_unique_cols.append({
-                        "column": col,
-                        "duplicate_counts": col_duplicates[col_duplicates > 1].to_dict()
-                    })
-        
-        duplicate_analysis["likely_unique_column_issues"] = likely_unique_cols
-        
-        return duplicate_analysis
-    
-    def analyze_column_inconsistencies(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Analyze column inconsistencies or contradictions efficiently
-        
-        Args:
-            df: DataFrame to analyze
-            
-        Returns:
-            Dictionary with column inconsistency analysis
-        """
-        inconsistency_analysis = {}
-        
-        # Check for categorical inconsistencies (case, spelling, etc.)
-        categorical_columns = df.select_dtypes(include=["object"]).columns
-        
-        for col in categorical_columns:
-            # Sample for large datasets
-            series = df[col]
-            if len(series) > 25000:
-                sample_series = series.sample(n=min(25000, len(series)), random_state=42)
-                unique_values = sample_series.dropna().unique()
-            else:
-                unique_values = series.dropna().unique()
-            
-            # Check for case inconsistencies
-            lowercase_values = [str(val).lower() for val in unique_values if pd.notna(val)]
-            original_to_lowercase = {str(val): str(val).lower() for val in unique_values if pd.notna(val)}
-            
-            # Find values that differ only by case
-            lowercase_counts = pd.Series(lowercase_values).value_counts()
-            case_variants = lowercase_counts[lowercase_counts > 1]
-            
-            if len(case_variants) > 0:
-                case_inconsistencies = {}
-                for case_val in case_variants.index:
-                    original_forms = [orig for orig, lower in original_to_lowercase.items() if lower == case_val]
-                    if len(original_forms) > 1:
-                        case_inconsistencies[case_val] = original_forms[:10]  # Limit to first 10 variants
-                
-                if case_inconsistencies:
-                    inconsistency_analysis[f"{col}_case_inconsistencies"] = case_inconsistencies
-        
-        return inconsistency_analysis
-    
-    def comprehensive_data_analysis(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Perform comprehensive analysis of the provided dataframe
-        
-        Args:
-            df: DataFrame to analyze
-            
-        Returns:
-            Dictionary with complete analysis report
-        """
-        # Perform all analyses
-        analysis_results = {
-            "dataset_overview": {
-                "shape": df.shape,
-                "columns": df.columns.tolist(),
-                "dtypes": df.dtypes.to_dict(),
-                "memory_usage": df.memory_usage(deep=True).sum()
-            },
-            "missing_values": self.analyze_missing_values(df),
-            "format_inconsistencies": self.analyze_format_inconsistencies(df),
-            "broken_entries": self.analyze_broken_entries(df),
-            "duplicates": self.analyze_duplicates(df),
-            "column_inconsistencies": self.analyze_column_inconsistencies(df)
+        ph_mask  = df.apply(
+            lambda c: c.astype(str).str.strip().str.lower().isin(PLACEHOLDER_VALUES)
+        )
+        nan_mask = df.isnull()
+        emp_mask = df.apply(lambda c: c.astype(str).str.strip().eq(""))
+        combined = nan_mask | emp_mask | ph_mask
+
+        total = combined.sum()
+        pct   = (total / len(df) * 100).round(2)
+        return {
+            "total_missing_per_column": total[total > 0].to_dict(),
+            "pct_missing_per_column":   pct[pct > 0].to_dict(),
+            "standard_nan_counts":      nan_mask.sum()[nan_mask.sum() > 0].to_dict(),
+            "empty_string_counts":      emp_mask.sum()[emp_mask.sum() > 0].to_dict(),
+            "placeholder_counts":       ph_mask.sum()[ph_mask.sum() > 0].to_dict(),
         }
-        
-        self.analysis_report = analysis_results
-        return analysis_results
-    
+
+    def analyze_format_inconsistencies(self, df: pd.DataFrame) -> Dict[str, Any]:
+        sample  = df.sample(min(5_000, len(df)), random_state=42)
+        result: Dict[str, Any] = {}
+
+        for col in df.columns:
+            s = sample[col].dropna()
+
+            # mixed Python types
+            utypes = {type(v).__name__ for v in s}
+            if len(utypes) > 1:
+                result[f"{col}_mixed_types"] = list(utypes)
+
+            col_l = col.lower()
+
+            # date-format variety
+            if any(kw in col_l for kw in _DATE_KW):
+                fmts: set = set()
+                for v in s.astype(str):
+                    if re.match(r"\d{4}-\d{2}-\d{2}", v):     fmts.add("YYYY-MM-DD")
+                    elif re.match(r"\d{1,2}/\d{1,2}/\d{4}", v): fmts.add("MM/DD/YYYY")
+                    elif re.match(r"\d{1,2}-\d{1,2}-\d{4}", v): fmts.add("MM-DD-YYYY")
+                    elif re.match(r"\d{1,2} \w+ \d{4}", v):     fmts.add("DD Month YYYY")
+                if len(fmts) > 1:
+                    result[f"{col}_multiple_date_formats"] = list(fmts)
+
+            # numeric-string format variety
+            if s.dtype == object:
+                pats: List[str] = []
+                for v in s.astype(str):
+                    if re.match(r"^\$?\d{1,3}(,\d{3})*(\.\d+)?$", v):
+                        pats.append("comma_formatted")
+                    elif re.match(r"^\$\d+(\.\d+)?$", v):
+                        pats.append("currency_symbol")
+                    elif re.match(r"^\d+$", v):
+                        pats.append("plain_integer")
+                    elif re.match(r"^\d+\.\d+$", v):
+                        pats.append("decimal")
+                if len(set(pats)) > 1:
+                    result[f"{col}_multiple_numeric_formats"] = list(set(pats))
+
+        return result
+
+    def analyze_broken_entries(self, df: pd.DataFrame) -> Dict[str, Any]:
+        broken: Dict[str, Any] = {}
+
+        for col in df.columns:
+            col_l  = col.lower()
+            series = df[col]
+
+            if "age" in col_l:
+                num = pd.to_numeric(series, errors="coerce")
+                bad = num[(num < 0) | (num > 150)].dropna()
+                if not bad.empty:
+                    broken[f"{col}_invalid_ages"] = {
+                        "count": len(bad), "examples": bad.head(5).tolist()
+                    }
+
+            if "email" in col_l:
+                bad = series[~series.astype(str).str.match(_EMAIL_PATTERN, na=False)]
+                bad = bad.dropna()
+                if not bad.empty:
+                    broken[f"{col}_invalid_emails"] = {
+                        "count": len(bad), "examples": bad.head(5).tolist()
+                    }
+
+            if any(kw in col_l for kw in ("phone", "mobile", "tel", "contact")):
+                bad = series[~series.astype(str).str.match(_PHONE_PATTERN, na=False)]
+                bad = bad.dropna()
+                if not bad.empty:
+                    broken[f"{col}_invalid_phones"] = {
+                        "count": len(bad), "examples": bad.head(5).tolist()
+                    }
+
+            if any(kw in col_l for kw in ("date", "birth", "dob")):
+                parsed    = pd.to_datetime(series, errors="coerce")
+                bad_dates = series[parsed.isna() & series.notna()]
+                if not bad_dates.empty:
+                    broken[f"{col}_unparseable_dates"] = {
+                        "count": len(bad_dates), "examples": bad_dates.head(5).tolist()
+                    }
+                if "birth" in col_l or "dob" in col_l:
+                    future = parsed[parsed > pd.Timestamp.now()]
+                    if not future.empty:
+                        broken[f"{col}_future_birth_dates"] = {
+                            "count": len(future),
+                            "examples": future.dropna()
+                                                .dt.strftime(DATE_OUTPUT_FORMAT)
+                                                .head(5).tolist(),
+                        }
+
+        return broken
+
+    def analyze_duplicates(self, df: pd.DataFrame) -> Dict[str, Any]:
+        exact = int(df.duplicated().sum())
+        result: Dict[str, Any] = {
+            "exact_duplicates":  exact,
+            "duplicate_indices": df[df.duplicated(keep=False)].index.tolist()[:20],
+        }
+
+        near_pairs: List[Dict] = []
+        str_cols = [
+            c for c in df.columns
+            if df[c].dtype == object
+            and any(kw in c.lower() for kw in ("name", "title", "description", "label"))
+        ]
+        for col in str_cols[:2]:
+            vals = df[col].dropna().astype(str).head(500).tolist()
+            for i in range(len(vals)):
+                for j in range(i + 1, len(vals)):
+                    score = fuzz.token_sort_ratio(vals[i], vals[j])
+                    if FUZZY_DEDUP_THRESHOLD <= score < 100:
+                        near_pairs.append(
+                            {"col": col, "a": vals[i], "b": vals[j], "score": score}
+                        )
+                    if len(near_pairs) >= 30:
+                        break
+                if len(near_pairs) >= 30:
+                    break
+
+        result["near_duplicate_pairs"] = near_pairs
+        return result
+
+    def analyze_outliers(self, df: pd.DataFrame) -> Dict[str, Any]:
+        report: Dict[str, Any] = {}
+        for col in df.select_dtypes(include=[np.number]).columns:
+            s = df[col].dropna()
+            if len(s) < 10:
+                continue
+            z      = np.abs(scipy_stats.zscore(s))
+            q1, q3 = s.quantile(0.25), s.quantile(0.75)
+            iqr    = q3 - q1
+            lo, hi = q1 - OUTLIER_IQR_MULTIPLIER * iqr, q3 + OUTLIER_IQR_MULTIPLIER * iqr
+            z_out  = s[z > OUTLIER_ZSCORE_THRESHOLD]
+            i_out  = s[(s < lo) | (s > hi)]
+            if not z_out.empty or not i_out.empty:
+                report[col] = {
+                    "z_score_outliers": {"count": len(z_out), "examples": z_out.head(5).tolist()},
+                    "iqr_outliers":     {
+                        "count": len(i_out), "examples": i_out.head(5).tolist(),
+                        "lower_fence": round(lo, 4), "upper_fence": round(hi, 4),
+                    },
+                }
+        return report
+
+    def analyze_column_inconsistencies(self, df: pd.DataFrame) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for col in df.select_dtypes(include="object").columns:
+            lower_map: Dict[str, List[str]] = {}
+            for v in df[col].dropna().unique():
+                k = str(v).strip().lower()
+                lower_map.setdefault(k, []).append(str(v))
+            variants = {k: vs for k, vs in lower_map.items() if len(vs) > 1}
+            if variants:
+                result[f"{col}_case_inconsistencies"] = variants
+        return result
+
+    def comprehensive_data_analysis(self, df: pd.DataFrame) -> Dict[str, Any]:
+        analysis = {
+            "dataset_overview": {
+                "shape":        df.shape,
+                "columns":      df.columns.tolist(),
+                "dtypes":       {c: str(t) for c, t in df.dtypes.items()},
+                "memory_bytes": int(df.memory_usage(deep=True).sum()),
+            },
+            "missing_values":         self.analyze_missing_values(df),
+            "format_inconsistencies": self.analyze_format_inconsistencies(df),
+            "broken_entries":         self.analyze_broken_entries(df),
+            "duplicates":             self.analyze_duplicates(df),
+            "outliers":               self.analyze_outliers(df),
+            "column_inconsistencies": self.analyze_column_inconsistencies(df),
+        }
+        self.analysis_report = analysis
+        return analysis
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 3. Human-readable report
+    # ──────────────────────────────────────────────────────────────────────────
     def document_issues_with_examples(self, df: pd.DataFrame) -> str:
-        """
-        Create a detailed report documenting all issues with specific examples
-        
-        Args:
-            df: DataFrame to analyze
-            
-        Returns:
-            String with detailed issue documentation
-        """
-        if df is None:
-            raise ValueError("DataFrame cannot be None. Provide a valid DataFrame for analysis.")
-        
-        # Perform comprehensive analysis
         self.comprehensive_data_analysis(df)
-        
-        report = []
-        report.append("# Data Quality Issues Report\n")
-        report.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        
-        # Overview
-        overview = self.analysis_report["dataset_overview"]
-        report.append(f"## Dataset Overview\n")
-        report.append(f"- Shape: {overview['shape'][0]} rows × {overview['shape'][1]} columns")
-        report.append(f"- Memory usage: {overview['memory_usage']} bytes ({overview['memory_usage']/1024/1024:.2f} MB)")
-        report.append(f"- Columns: {', '.join(overview['columns'])}\n")
-        
-        # Missing Values
-        missing_vals = self.analysis_report["missing_values"]
-        if missing_vals["total_missing_per_column"]:
-            report.append(f"## Missing Values\n")
-            for col, count in missing_vals["total_missing_per_column"].items():
-                report.append(f"- **{col}**: {count} missing values")
-                
-                # Show examples of missing values
-                missing_mask = (
-                    df[col].isnull() |
-                    (df[col].astype(str).str.strip() == "") |
-                    (df[col].astype(str).str.lower().isin(["n/a", "na", "null", "none", "empty", "missing", "unknown"]))
+        r     = self.analysis_report
+        lines: List[str] = []
+
+        lines += [
+            "# D-SARAL Data Quality Report",
+            f"Generated : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "## Dataset Overview",
+            f"- Rows    : {r['dataset_overview']['shape'][0]}",
+            f"- Columns : {r['dataset_overview']['shape'][1]}",
+            f"- Memory  : {r['dataset_overview']['memory_bytes'] / 1024 / 1024:.2f} MB",
+            f"- Columns : {', '.join(r['dataset_overview']['columns'])}",
+            "",
+        ]
+
+        mv = r["missing_values"]["total_missing_per_column"]
+        if mv:
+            lines.append("## Missing Values")
+            for col, cnt in mv.items():
+                pct = r["missing_values"]["pct_missing_per_column"].get(col, 0)
+                lines.append(f"- **{col}**: {cnt} missing ({pct} %)")
+            lines.append("")
+
+        fi = r["format_inconsistencies"]
+        if fi:
+            lines.append("## Format Inconsistencies")
+            for k, v in fi.items():
+                lines.append(f"- **{k}**: {v}")
+            lines.append("")
+
+        be = r["broken_entries"]
+        if be:
+            lines.append("## Broken Entries")
+            for k, v in be.items():
+                lines.append(
+                    f"- **{k}**: {v['count']} entries  —  examples: {v.get('examples', [])[:3]}"
                 )
-                examples = df[missing_mask][col].head(3).tolist()
-                report.append(f"  - Examples: {examples}")
-            report.append("")
-        
-        # Format Inconsistencies
-        format_issues = self.analysis_report["format_inconsistencies"]
-        if format_issues:
-            report.append(f"## Format Inconsistencies\n")
-            for issue_type, details in format_issues.items():
-                report.append(f"- **{issue_type}**: {details}")
-            report.append("")
-        
-        # Broken Entries
-        broken_entries = self.analysis_report["broken_entries"]
-        if broken_entries:
-            report.append(f"## Broken Entries\n")
-            for issue_type, details in broken_entries.items():
-                report.append(f"- **{issue_type}**: {details.get('count', 'N/A')} problematic entries")
-                if 'values' in details:
-                    report.append(f"  - Examples: {details['values'][:3]}")  # Show first 3 examples
-            report.append("")
-        
-        # Duplicates
-        duplicates = self.analysis_report["duplicates"]
-        if duplicates.get("total_row_duplicates", 0) > 0:
-            report.append(f"## Duplicates\n")
-            report.append(f"- Total row duplicates: {duplicates['total_row_duplicates']}")
-            if duplicates.get("estimated_from_sample"):
-                report.append("- Note: This is an estimate from sampling due to large dataset size")
-            if "duplicate_row_indices" in duplicates:
-                report.append(f"  - First few duplicate indices: {duplicates['duplicate_row_indices']}")
-            report.append("")
-        
-        # Column Inconsistencies
-        col_inconsistencies = self.analysis_report["column_inconsistencies"]
-        if col_inconsistencies:
-            report.append(f"## Column Inconsistencies\n")
-            for issue_type, details in col_inconsistencies.items():
-                report.append(f"- **{issue_type}**: {details}")
-            report.append("")
-        
-        return "\n".join(report)
-    
+            lines.append("")
+
+        dup = r["duplicates"]
+        lines.append("## Duplicates")
+        lines.append(f"- Exact duplicates : {dup['exact_duplicates']}")
+        if dup.get("near_duplicate_pairs"):
+            lines.append(f"- Near-duplicate pairs : {len(dup['near_duplicate_pairs'])}")
+            for p in dup["near_duplicate_pairs"][:5]:
+                lines.append(
+                    f"  - [{p['score']} %]  \"{p['a']}\"  ≈  \"{p['b']}\"  (col: {p['col']})"
+                )
+        lines.append("")
+
+        ol = r["outliers"]
+        if ol:
+            lines.append("## Outliers")
+            for col, info in ol.items():
+                z  = info["z_score_outliers"]["count"]
+                iq = info["iqr_outliers"]["count"]
+                lo = info["iqr_outliers"]["lower_fence"]
+                hi = info["iqr_outliers"]["upper_fence"]
+                lines.append(
+                    f"- **{col}**: {z} z-score | {iq} IQR  (fences: [{lo}, {hi}])"
+                )
+            lines.append("")
+
+        ci = r["column_inconsistencies"]
+        if ci:
+            lines.append("## Case / Spelling Inconsistencies")
+            for k, v in ci.items():
+                lines.append(f"- **{k}**: {v}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 4. THE CLEANING ENGINE
+    # ──────────────────────────────────────────────────────────────────────────
     def apply_cleaning_techniques(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply appropriate cleaning techniques to create a refined dataset
-        
-        Args:
-            df: DataFrame to clean
-            
-        Returns:
-            Cleaned DataFrame
+        14-step production-grade cleaning pipeline.
+        Input  : raw DataFrame (any mix of types / quality)
+        Output : ML / EDA-ready DataFrame — no further cleaning needed.
         """
-        if df is None:
-            raise ValueError("DataFrame cannot be None. Provide a valid DataFrame for cleaning.")
-        
         original_shape = df.shape
-        cleaned_df = df.copy()
-        
-        print("Applying cleaning techniques...")
-        
-        # For very large datasets, process in chunks
-        chunk_size = min(10000, len(df))
-        
-        # 1. Handle missing values
-        print("- Handling missing values...")
-        for col in cleaned_df.columns:
-            # Replace common placeholders with NaN
-            cleaned_df[col] = cleaned_df[col].replace(["N/A", "NA", "NULL", "null", "nan", "NaN", "None", "empty", "missing", "Unknown", "unknown"], np.nan)
-            
-            # Also handle empty strings
-            cleaned_df[col] = cleaned_df[col].replace("", np.nan)
-        
-        # 2. Fix format inconsistencies
-        print("- Fixing format inconsistencies...")
-        for col in cleaned_df.columns:
-            # Standardize text case for categorical columns
-            if cleaned_df[col].dtype == "object":
-                # If the column seems categorical based on name or value patterns
-                if any(keyword in col.lower() for keyword in ["name", "department", "category", "type", "status"]):
-                    # Process in chunks for large datasets
-                    if len(cleaned_df) > chunk_size:
-                        for i in range(0, len(cleaned_df), chunk_size):
-                            chunk_end = min(i + chunk_size, len(cleaned_df))
-                            cleaned_df.loc[i:chunk_end-1, col] = cleaned_df.loc[i:chunk_end-1, col].str.title()
-                    else:
-                        cleaned_df[col] = cleaned_df[col].str.title()  # Title case for names/categories
-                    
-                    # Handle case variations specifically
-                    case_mappings = {}
-                    unique_vals = cleaned_df[col].dropna().unique()
-                    for val in unique_vals:
-                        if pd.notna(val):
-                            lowercase_val = str(val).lower()
-                            # Group similar values by lowercase
-                            if lowercase_val not in case_mappings:
-                                case_mappings[lowercase_val] = str(val)  # Keep first encountered format
-                    
-                    # Map all variations to standard format
-                    if len(cleaned_df) > chunk_size:
-                        # Process in chunks to avoid memory issues
-                        for i in range(0, len(cleaned_df), chunk_size):
-                            chunk_end = min(i + chunk_size, len(cleaned_df))
-                            cleaned_df.loc[i:chunk_end-1, col] = cleaned_df.loc[i:chunk_end-1, col].apply(
-                                lambda x: case_mappings.get(str(x).lower(), x) if pd.notna(x) else x
-                            )
-                    else:
-                        cleaned_df[col] = cleaned_df[col].apply(
-                            lambda x: case_mappings.get(str(x).lower(), x) if pd.notna(x) else x
-                        )
-            
-            # Fix numeric columns stored as strings
-            if "salary" in col.lower() or "income" in col.lower() or "amount" in col.lower():
-                # Remove currency symbols and commas, convert to numeric
-                # Process in chunks for large datasets
-                if len(cleaned_df) > chunk_size:
-                    for i in range(0, len(cleaned_df), chunk_size):
-                        chunk_end = min(i + chunk_size, len(cleaned_df))
-                        cleaned_df.loc[i:chunk_end-1, col] = cleaned_df.loc[i:chunk_end-1, col].astype(str).str.replace(r"[^\d.-]", "", regex=True)
-                        cleaned_df.loc[i:chunk_end-1, col] = pd.to_numeric(cleaned_df.loc[i:chunk_end-1, col], errors="coerce")
+        df             = df.copy()
+        self._log("START", original_shape, df.shape, "Pipeline started")
+
+        # ── Step 1  Encoding & whitespace ────────────────────────────────────
+        for col in df.select_dtypes(include="object").columns:
+            df[col] = (
+                df[col]
+                .astype(str)
+                .str.encode("ascii", errors="ignore")
+                .str.decode("ascii")
+                .str.strip()
+                .replace("nan", np.nan)
+            )
+        self._log("step_01_whitespace", original_shape, df.shape,
+                  "Encoding & whitespace normalised")
+
+        # ── Step 2  Placeholder → NaN ────────────────────────────────────────
+        for col in df.columns:
+            df[col] = df[col].replace("", np.nan)
+            mask = df[col].astype(str).str.strip().str.lower().isin(PLACEHOLDER_VALUES)
+            df.loc[mask, col] = np.nan
+        self._log("step_02_placeholders", original_shape, df.shape,
+                  "Placeholders → NaN")
+
+        # ── Step 3  Type inference & auto-cast ───────────────────────────────
+        for col in df.select_dtypes(include="object").columns:
+            col_l = col.lower()
+
+            # date columns first (before numeric strips the separators)
+            if any(kw in col_l for kw in _DATE_KW):
+                parsed = pd.to_datetime(df[col], errors="coerce")
+                hit_rate = parsed.notna().sum() / max(df[col].notna().sum(), 1)
+                if hit_rate > 0.7:
+                    df[col] = parsed
+                    continue
+
+            # numeric
+            cleaned_num = (
+                df[col].astype(str)
+                       .str.replace(r"[^\d.\-]", "", regex=True)
+                       .replace("", np.nan)
+            )
+            converted = pd.to_numeric(cleaned_num, errors="coerce")
+            hit_rate  = converted.notna().sum() / max(df[col].notna().sum(), 1)
+            if hit_rate > 0.85:
+                df[col] = converted
+
+        self._log("step_03_type_inference", original_shape, df.shape,
+                  "Type inference applied")
+
+        # ── Step 4  Smart missing-value imputation ───────────────────────────
+        imp_log: Dict[str, str] = {}
+        for col in list(df.columns):          # list() because we may drop cols
+            n_miss = df[col].isna().sum()
+            if n_miss == 0:
+                continue
+            pct = n_miss / len(df)
+
+            if pct > MISSING_DROP_THRESHOLD:
+                df.drop(columns=[col], inplace=True)
+                imp_log[col] = f"DROPPED (>{int(pct*100)} % missing)"
+                continue
+
+            if pd.api.types.is_numeric_dtype(df[col]):
+                if pct < 0.05:
+                    fv = df[col].median(); tag = f"median ({fv:.4g})"
+                elif pct < 0.30:
+                    fv = df[col].mean();   tag = f"mean ({fv:.4g})"
                 else:
-                    cleaned_df[col] = cleaned_df[col].astype(str).str.replace(r"[^\d.-]", "", regex=True)
-                    cleaned_df[col] = pd.to_numeric(cleaned_df[col], errors="coerce")
-        
-        # 3. Fix broken entries
-        print("- Fixing broken entries...")
-        for col in cleaned_df.columns:
-            if "age" in col.lower():
-                # Cap age values to reasonable range
-                if len(cleaned_df) > chunk_size:
-                    for i in range(0, len(cleaned_df), chunk_size):
-                        chunk_end = min(i + chunk_size, len(cleaned_df))
-                        numeric_age = pd.to_numeric(cleaned_df.loc[i:chunk_end-1, col], errors="coerce")
-                        cleaned_df.loc[i:chunk_end-1, col] = numeric_age.apply(lambda x: x if 0 <= x <= 120 else np.nan)
-                else:
-                    numeric_age = pd.to_numeric(cleaned_df[col], errors="coerce")
-                    cleaned_df[col] = numeric_age.apply(lambda x: x if 0 <= x <= 120 else np.nan)
-            
-            if "email" in col.lower():
-                # Keep only valid email formats
-                email_pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-                if len(cleaned_df) > chunk_size:
-                    for i in range(0, len(cleaned_df), chunk_size):
-                        chunk_end = min(i + chunk_size, len(cleaned_df))
-                        valid_email_mask = cleaned_df.loc[i:chunk_end-1, col].astype(str).str.contains(email_pattern, na=False)
-                        cleaned_df.loc[i:chunk_end-1, ~valid_email_mask, col] = np.nan
-                else:
-                    valid_email_mask = cleaned_df[col].astype(str).str.contains(email_pattern, na=False)
-                    cleaned_df.loc[~valid_email_mask, col] = np.nan
-            
-            if "date" in col.lower() or "birth" in col.lower():
-                # Parse dates consistently
-                if len(cleaned_df) > chunk_size:
-                    for i in range(0, len(cleaned_df), chunk_size):
-                        chunk_end = min(i + chunk_size, len(cleaned_df))
-                        cleaned_df.loc[i:chunk_end-1, col] = pd.to_datetime(cleaned_df.loc[i:chunk_end-1, col], errors="coerce")
-                else:
-                    cleaned_df[col] = pd.to_datetime(cleaned_df[col], errors="coerce")
-        
-        # 4. Handle duplicates
-        print("- Handling duplicates...")
-        print("  Checking for duplicates...")
-        
-        # For very large datasets, estimate duplicates first
-        if len(cleaned_df) > 50000:
-            sample_size = min(10000, len(cleaned_df))
-            sample_df = cleaned_df.sample(n=sample_size, random_state=42)
-            estimated_duplicates = int((sample_df.duplicated().sum() / sample_size) * len(cleaned_df))
-            print(f"  Estimated duplicates: ~{estimated_duplicates}")
-        
-        # Actually drop duplicates
-        initial_duplicate_count = cleaned_df.duplicated().sum()
-        print(f"  Actual duplicates found: {initial_duplicate_count}")
-        cleaned_df = cleaned_df.drop_duplicates()
-        final_duplicate_count = cleaned_df.duplicated().sum()
-        
-        print(f"  After dropping duplicates: {cleaned_df.shape}")
-        
-        # Log cleaning steps
+                    fv = df[col].median(); tag = f"median-high ({fv:.4g})"
+                df[col].fillna(fv, inplace=True)
+
+            elif pd.api.types.is_datetime64_any_dtype(df[col]):
+                fv  = df[col].dropna().sort_values().iloc[len(df[col].dropna()) // 2]
+                tag = f"median_date ({fv})"
+                df[col].fillna(fv, inplace=True)
+
+            else:
+                modes = df[col].mode()
+                fv    = modes[0] if not modes.empty else "UNKNOWN"
+                tag   = f"mode ('{fv}')"
+                df[col].fillna(fv, inplace=True)
+
+            imp_log[col] = tag
+
+        self.cleaning_log.append({"step": "step_04_imputation", "details": imp_log})
+        self._log("step_04_imputation", original_shape, df.shape,
+                  f"Imputed {len(imp_log)} columns")
+
+        # ── Step 5  Date standardisation → ISO 8601 ──────────────────────────
+        for col in df.select_dtypes(
+            include=["datetime64[ns]", "datetime64[ns, UTC]"]
+        ).columns:
+            df[col] = df[col].dt.strftime(DATE_OUTPUT_FORMAT)
+
+        for col in df.select_dtypes(include="object").columns:
+            col_l = col.lower()
+            if any(kw in col_l for kw in _DATE_KW):
+                parsed   = pd.to_datetime(df[col], errors="coerce")
+                hit_rate = parsed.notna().sum() / max(df[col].notna().sum(), 1)
+                if hit_rate > 0.5:
+                    df[col] = parsed.dt.strftime(DATE_OUTPUT_FORMAT)
+
+        self._log("step_05_dates", original_shape, df.shape,
+                  "Dates standardised → ISO 8601")
+
+        # ── Step 6  Numeric-string normalisation (ALL object cols) ────────────
+        #   Tries every object column; only replaces if ≥70 % parse cleanly.
+        for col in df.select_dtypes(include="object").columns:
+            col_l = col.lower()
+            # skip columns that are clearly not numeric
+            if any(kw in col_l for kw in ("name", "email", "url", "address",
+                                          "description", "comment", "note",
+                                          "text", "label", "tag")):
+                continue
+            cleaned = (
+                df[col].astype(str)
+                       .str.replace(r"[^\d.\-]", "", regex=True)
+                       .replace("", np.nan)
+            )
+            as_num   = pd.to_numeric(cleaned, errors="coerce")
+            hit_rate = as_num.notna().sum() / max(df[col].notna().sum(), 1)
+            if hit_rate >= 0.70:
+                df[col] = as_num
+
+        self._log("step_06_numeric_normalise", original_shape, df.shape,
+                  "Numeric-string columns normalised")
+
+        # ── Step 7  Text-case standardisation ────────────────────────────────
+        for col in df.select_dtypes(include="object").columns:
+            col_l = col.lower()
+            if any(kw in col_l for kw in _TITLE_KW):
+                df[col] = df[col].str.title()
+            elif any(kw in col_l for kw in _LOWER_KW):
+                df[col] = df[col].str.lower()
+
+        self._log("step_07_text_case", original_shape, df.shape,
+                  "Text case standardised")
+
+        # ── Step 8  Outlier capping (IQR) ─────────────────────────────────────
+        caps: Dict[str, Dict] = {}
+        for col in df.select_dtypes(include=[np.number]).columns:
+            if any(kw in col.lower() for kw in _SKIP_OUTLIER_KW):
+                continue
+            q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+            iqr     = q3 - q1
+            if iqr == 0:
+                continue
+            lo = q1 - OUTLIER_IQR_MULTIPLIER * iqr
+            hi = q3 + OUTLIER_IQR_MULTIPLIER * iqr
+            n  = int(((df[col] < lo) | (df[col] > hi)).sum())
+            if n:
+                df[col] = df[col].clip(lower=lo, upper=hi)
+                caps[col] = {"capped": n, "lo": round(lo, 4), "hi": round(hi, 4)}
+
+        self.cleaning_log.append({"step": "step_08_outlier_caps", "details": caps})
+        self._log("step_08_outlier_cap", original_shape, df.shape,
+                  f"Outliers capped in {len(caps)} columns")
+
+        # ── Step 9  Domain validation & nullification ─────────────────────────
+        for col in df.columns:
+            col_l = col.lower()
+
+            if "age" in col_l and pd.api.types.is_numeric_dtype(df[col]):
+                df.loc[(df[col] < 0) | (df[col] > 120), col] = np.nan
+
+            if "email" in col_l:
+                invalid = ~df[col].astype(str).str.match(_EMAIL_PATTERN, na=False)
+                df.loc[invalid, col] = np.nan
+
+            if any(kw in col_l for kw in ("phone", "mobile", "tel")):
+                invalid = ~df[col].astype(str).str.match(_PHONE_PATTERN, na=False)
+                df.loc[invalid, col] = np.nan
+
+        self._log("step_09_domain_validation", original_shape, df.shape,
+                  "Invalid ages / emails / phones nullified")
+
+        # ── Step 10  Exact deduplication ──────────────────────────────────────
+        before = len(df)
+        df.drop_duplicates(inplace=True)
+        df.reset_index(drop=True, inplace=True)
+        self._log("step_10_exact_dedup", original_shape, df.shape,
+                  f"Removed {before - len(df)} exact duplicates")
+
+        # ── Step 11  Fuzzy near-duplicate flagging ────────────────────────────
+        str_cols = [
+            c for c in df.columns
+            if df[c].dtype == object
+            and any(kw in c.lower() for kw in ("name", "title", "description", "label"))
+        ]
+        n_flagged = 0
+        if str_cols:
+            primary = str_cols[0]
+            vals    = df[primary].fillna("").astype(str).tolist()
+            flags   = [False] * len(vals)
+            for i in range(len(vals)):
+                if flags[i]:
+                    continue
+                for j in range(i + 1, min(i + 300, len(vals))):
+                    if fuzz.token_sort_ratio(vals[i], vals[j]) >= FUZZY_DEDUP_THRESHOLD:
+                        flags[j] = True
+            n_flagged = sum(flags)
+            if n_flagged:
+                df["_dsaral_near_duplicate"] = flags
+
+        self._log("step_11_fuzzy_dedup", original_shape, df.shape,
+                  f"Flagged {n_flagged} near-duplicates")
+
+        # ── Step 12  Constant / near-constant column removal ──────────────────
+        dropped: List[str] = []
+        for col in list(df.columns):
+            if col.startswith("_dsaral_"):
+                continue
+            top = df[col].value_counts(normalize=True, dropna=False).iloc[0]
+            if top >= NEAR_CONSTANT_THRESHOLD:
+                df.drop(columns=[col], inplace=True)
+                dropped.append(col)
+
+        self._log("step_12_const_cols", original_shape, df.shape,
+                  f"Dropped {len(dropped)} near-constant columns: {dropped}")
+
+        # ── Step 13  Column-name normalisation ───────────────────────────────
+        df.columns = [
+            re.sub(r"\s+", "_", c.strip().lower())
+               .replace("-", "_")
+               .replace(".", "_")
+            for c in df.columns
+        ]
+        self._log("step_13_col_names", original_shape, df.shape,
+                  "Column names normalised (snake_case)")
+
+        # ── Step 14  Final type enforcement ───────────────────────────────────
+        for col in df.select_dtypes(include=[np.number]).columns:
+            s = df[col].dropna()
+            if len(s) and s.apply(lambda x: float(x).is_integer()).all():
+                try:
+                    df[col] = df[col].astype("Int64")
+                except Exception:
+                    pass
+
+        self._log("step_14_final_types", original_shape, df.shape,
+                  "Final integer types enforced")
+
+        # ── Summary ──────────────────────────────────────────────────────────
+        self._log(
+            "COMPLETE", original_shape, df.shape,
+            f"Done. Rows: {original_shape[0]}→{df.shape[0]}  "
+            f"Cols: {original_shape[1]}→{df.shape[1]}"
+        )
+        self.processed_data = df
+        return df
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ──────────────────────────────────────────────────────────────────────────
+    def _log(self, step: str, orig, cur, msg: str) -> None:
         self.cleaning_log.append({
-            "step": "Handle missing values",
-            "original_shape": original_shape,
-            "current_shape": cleaned_df.shape,
-            "rows_removed": original_shape[0] - cleaned_df.shape[0]  # Track actual rows removed
+            "step":           step,
+            "original_shape": list(orig),
+            "current_shape":  list(cur),
+            "message":        msg,
+            "timestamp":      datetime.now().isoformat(),
         })
-        
-        print(f"Cleaning completed. Shape changed from {original_shape} to {cleaned_df.shape}")
-        
-        self.processed_data = cleaned_df
-        return cleaned_df
-    
-    def save_cleaned_data(self, cleaned_df: pd.DataFrame, output_path: str):
-        """
-        Save the cleaned dataset to the specified location
-        
-        Args:
-            cleaned_df: Cleaned DataFrame to save
-            output_path: Path to save the cleaned data
-        """
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        
-        # Save as CSV
-        cleaned_df.to_csv(output_path, index=False)
-        
-        # Also save analysis report
-        report_path = output_path.replace(".csv", "_analysis_report.txt")
-        with open(report_path, "w") as f:
-            f.write(self.document_issues_with_examples(cleaned_df))
-        
-        # Save cleaning log
-        log_path = output_path.replace(".csv", "_cleaning_log.json")
-        with open(log_path, "w") as f:
-            json.dump(self.cleaning_log, f, indent=2, default=str)
-    
-    def validate_file_type(self, filename: str, allowed_extensions: list) -> bool:
-        """
-        Validate if a file has an allowed extension
-        
-        Args:
-            filename: Name of the file to validate
-            allowed_extensions: List of allowed extensions (without dots)
-            
-        Returns:
-            Boolean indicating if the file type is valid
-        """
-        if not filename:
-            return False
-        
-        extension = filename.rsplit('.', 1)[-1].lower()
-        return extension in allowed_extensions
-    
-    def secure_file_path(self, file_path: str, base_directory: str) -> str:
-        """
-        Secure a file path to prevent directory traversal attacks
-        
-        Args:
-            file_path: Original file path
-            base_directory: Base directory to validate against
-            
-        Returns:
-            Secured file path or raises ValueError if unsafe
-        """
-        # Resolve the absolute paths
-        abs_base = os.path.abspath(base_directory)
-        abs_path = os.path.abspath(file_path)
-        
-        # Check if the file path is within the allowed base directory
-        if not abs_path.startswith(abs_base):
-            raise ValueError(f"File path '{file_path}' is outside allowed directory '{base_directory}'")
-        
-        return abs_path
-    
-    def calculate_data_quality_metrics(self, original_df: pd.DataFrame, cleaned_df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Calculate metrics comparing original and cleaned data quality
-        
-        Args:
-            original_df: Original DataFrame before cleaning
-            cleaned_df: Cleaned DataFrame after processing
-            
-        Returns:
-            Dictionary with data quality metrics
-        """
-        original_missing = original_df.isnull().sum().sum()
-        cleaned_missing = cleaned_df.isnull().sum().sum()
-        
-        original_duplicates = original_df.duplicated().sum()
-        cleaned_duplicates = cleaned_df.duplicated().sum()
-        
-        return {
-            "original_missing_values": original_missing,
-            "cleaned_missing_values": cleaned_missing,
-            "missing_values_improvement": original_missing - cleaned_missing,
-            "original_duplicate_rows": original_duplicates,
-            "cleaned_duplicate_rows": cleaned_duplicates,
-            "duplicate_removal_count": original_duplicates - cleaned_duplicates,
-            "data_retention_rate": len(cleaned_df) / len(original_df) * 100 if len(original_df) > 0 else 0,
-            "columns_changed": len(original_df.columns) - len(cleaned_df.columns)
-        }
-
-
-# Utility functions for file handling
-def validate_and_secure_filename(filename: str) -> str:
-    """
-    Validate and secure a filename for safe usage
-    
-    Args:
-        filename: Original filename
-        
-    Returns:
-        Secured filename
-    """
-    return secure_filename(filename)
-
-
-def create_temp_directory(prefix: str = "dsaral_") -> str:
-    """
-    Create a temporary directory for processing
-    
-    Args:
-        prefix: Prefix for the temporary directory name
-        
-    Returns:
-        Path to the created temporary directory
-    """
-    temp_dir = tempfile.mkdtemp(prefix=prefix)
-    return temp_dir
-
-
-def cleanup_temp_directory(temp_dir: str):
-    """
-    Clean up a temporary directory and all its contents
-    
-    Args:
-        temp_dir: Path to the temporary directory to clean up
-    """
-    if os.path.exists(temp_dir):
-        import shutil
-        shutil.rmtree(temp_dir)
+        print(f"[{step}] {msg}  →  shape: {cur}")

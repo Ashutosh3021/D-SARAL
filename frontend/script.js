@@ -1,451 +1,342 @@
-// Global variables
-let currentStep = 1;
-let sessionId = null;
-let fileType = 'csv';
-let uploadedFiles = [];
-let processingInterval = null;
+'use strict';
 
-// DOM Elements
-const stepElements = {
-    1: document.getElementById('step1'),
-    2: document.getElementById('step2'),
-    3: document.getElementById('step3'),
-    4: document.getElementById('step4')
+// ── Constants ─────────────────────────────────────────
+const CIRC = 213.6; // 2π × 34 (ring radius)
+const EXT  = { csv: ['.csv'], json: ['.json'], txt: ['.txt', '.tsv'] };
+
+// ── State ─────────────────────────────────────────────
+let state = {
+  step:    1,
+  session: null,
+  type:    'csv',
+  files:   [],
 };
 
-const stepIndicators = document.querySelectorAll('.step-indicator');
-const fileTypeCards = document.querySelectorAll('.file-type-card');
-const nextBtn1 = document.getElementById('nextBtn1');
-const prevBtn2 = document.getElementById('prevBtn2');
-const processBtn = document.getElementById('processBtn');
-const browseBtn = document.getElementById('browseBtn');
-const fileInput = document.getElementById('fileInput');
-const uploadArea = document.getElementById('uploadArea');
-const fileList = document.getElementById('fileList');
-const filePreview = document.getElementById('filePreview');
-const selectedFileTypeSpan = document.getElementById('selectedFileType');
-const progressFill = document.getElementById('progressFill');
-const progressText = document.getElementById('progressText');
-const statusMessages = document.getElementById('statusMessages');
-const downloadBtn = document.getElementById('downloadBtn');
-const viewReportBtn = document.getElementById('viewReportBtn');
-const newAnalysisBtn = document.getElementById('newAnalysisBtn');
-const reportModal = document.getElementById('reportModal');
-const reportContent = document.getElementById('reportContent');
-const modalClose = document.querySelector('.modal-close');
+// ── DOM refs ──────────────────────────────────────────
+const $ = id => document.getElementById(id);
 
-// Initialize the application
-document.addEventListener('DOMContentLoaded', function() {
-    initializeEventListeners();
-    updateStepIndicator(currentStep);
+const stepEls      = { 1: $('step1'), 2: $('step2'), 3: $('step3'), 4: $('step4') };
+const stepperItems = document.querySelectorAll('.stepper-item');
+const typeCards    = document.querySelectorAll('.type-card');
+
+const nextBtn1      = $('nextBtn1');
+const prevBtn2      = $('prevBtn2');
+const processBtn    = $('processBtn');
+const browseBtn     = $('browseBtn');
+const fileInput     = $('fileInput');
+const uploadArea    = $('uploadArea');
+const fileListEl    = $('fileList');
+const filePreview   = $('filePreview');
+const fileTypeSpan  = $('selectedFileType');
+const ringFill      = $('ringFill');
+const ringPct       = $('ringPct');
+const progressRing  = $('progressRing');
+const progressText  = $('progressText');
+const logStream     = $('statusMessages');
+const downloadBtn   = $('downloadBtn');
+const viewReportBtn = $('viewReportBtn');
+const newAnalysisBtn= $('newAnalysisBtn');
+const reportModal   = $('reportModal');
+const reportContent = $('reportContent');
+const modalClose    = $('modalClose');
+
+// ── Bootstrap ─────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  bindEvents();
+  setRing(0);
 });
 
-// Initialize event listeners
-function initializeEventListeners() {
-    // File type selection
-    fileTypeCards.forEach(card => {
-        card.addEventListener('click', function() {
-            selectFileType(this.dataset.type);
-        });
-    });
+// ── Event binding ─────────────────────────────────────
+function bindEvents() {
+  // File type cards
+  typeCards.forEach(c => c.addEventListener('click', () => pickType(c.dataset.type)));
 
-    // Navigation buttons
-    nextBtn1.addEventListener('click', () => goToStep(2));
-    prevBtn2.addEventListener('click', () => goToStep(1));
-    processBtn.addEventListener('click', processFiles);
-    newAnalysisBtn.addEventListener('click', resetWizard);
+  // Wizard navigation
+  nextBtn1.addEventListener('click',      () => goTo(2));
+  prevBtn2.addEventListener('click',      () => goTo(1));
+  processBtn.addEventListener('click',    run);
+  newAnalysisBtn.addEventListener('click', reset);
 
-    // File upload
-    browseBtn.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', handleFileSelection);
-    
-    // Drag and drop
-    uploadArea.addEventListener('dragover', handleDragOver);
-    uploadArea.addEventListener('dragleave', handleDragLeave);
-    uploadArea.addEventListener('drop', handleDrop);
-    
-    // Modal
-    modalClose.addEventListener('click', closeModal);
-    reportModal.addEventListener('click', function(e) {
-        if (e.target === reportModal) {
-            closeModal();
-        }
-    });
+  // File input
+  browseBtn.addEventListener('click',  () => fileInput.click());
+  fileInput.addEventListener('change', e  => ingest(Array.from(e.target.files)));
 
-    // Download and report buttons
-    downloadBtn.addEventListener('click', downloadResults);
-    viewReportBtn.addEventListener('click', viewReport);
-}
-
-// File type selection
-function selectFileType(type) {
-    fileType = type;
-    
-    // Update UI
-    fileTypeCards.forEach(card => {
-        card.classList.remove('selected');
-    });
-    
-    const selectedCard = document.querySelector(`[data-type="${type}"]`);
-    selectedCard.classList.add('selected');
-    
-    // Update file type display
-    const fileTypeNames = {
-        'csv': 'CSV',
-        'json': 'JSON',
-        'txt': 'Text'
-    };
-    selectedFileTypeSpan.textContent = fileTypeNames[type];
-    
-    // Enable next button
-    nextBtn1.disabled = false;
-}
-
-// Navigation between steps
-function goToStep(step) {
-    // Hide current step
-    stepElements[currentStep].classList.remove('active');
-    
-    // Show new step
-    stepElements[step].classList.add('active');
-    
-    // Update indicators
-    updateStepIndicator(step);
-    
-    currentStep = step;
-}
-
-function updateStepIndicator(step) {
-    stepIndicators.forEach((indicator, index) => {
-        const indicatorStep = index + 1;
-        
-        if (indicatorStep < step) {
-            indicator.classList.add('completed');
-            indicator.classList.remove('active');
-        } else if (indicatorStep === step) {
-            indicator.classList.add('active');
-            indicator.classList.remove('completed');
-        } else {
-            indicator.classList.remove('active', 'completed');
-        }
-    });
-    
-    // Update progress lines
-    const progressLines = document.querySelectorAll('.progress-line');
-    progressLines.forEach((line, index) => {
-        if (index < step - 1) {
-            line.classList.add('completed');
-        } else {
-            line.classList.remove('completed');
-        }
-    });
-}
-
-// File upload handling
-function handleFileSelection(event) {
-    const files = Array.from(event.target.files);
-    processSelectedFiles(files);
-}
-
-function handleDragOver(event) {
-    event.preventDefault();
-    uploadArea.classList.add('drag-over');
-}
-
-function handleDragLeave(event) {
-    event.preventDefault();
+  // Drag & drop
+  uploadArea.addEventListener('dragover',  e => { e.preventDefault(); uploadArea.classList.add('drag-over'); });
+  uploadArea.addEventListener('dragleave', e => { e.preventDefault(); uploadArea.classList.remove('drag-over'); });
+  uploadArea.addEventListener('drop',      e => {
+    e.preventDefault();
     uploadArea.classList.remove('drag-over');
+    ingest(Array.from(e.dataTransfer.files));
+  });
+
+  // Keyboard: allow Enter/Space on dropzone
+  uploadArea.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+  });
+
+  // Modal
+  modalClose.addEventListener('click', closeModal);
+  reportModal.addEventListener('click', e => { if (e.target === reportModal) closeModal(); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+  // Result actions
+  downloadBtn.addEventListener('click',   downloadResults);
+  viewReportBtn.addEventListener('click', viewReport);
 }
 
-function handleDrop(event) {
-    event.preventDefault();
-    uploadArea.classList.remove('drag-over');
-    
-    const files = Array.from(event.dataTransfer.files);
-    processSelectedFiles(files);
+// ── Wizard navigation ─────────────────────────────────
+function goTo(step) {
+  stepEls[state.step].classList.remove('active');
+  stepEls[step].classList.add('active');
+  state.step = step;
+  syncStepper();
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
-function processSelectedFiles(files) {
-    // Filter files by selected type
-    const allowedExtensions = {
-        'csv': ['.csv'],
-        'json': ['.json'],
-        'txt': ['.txt', '.tsv']
-    };
-    
-    const validFiles = files.filter(file => {
-        const extension = '.' + file.name.split('.').pop().toLowerCase();
-        return allowedExtensions[fileType].includes(extension);
-    });
-    
-    if (validFiles.length === 0) {
-        alert(`Please select ${fileType.toUpperCase()} files only.`);
-        return;
+function syncStepper() {
+  stepperItems.forEach((item, i) => {
+    const s = i + 1;
+    item.classList.toggle('active',    s === state.step);
+    item.classList.toggle('completed', s <  state.step);
+  });
+}
+
+// ── File type selection ───────────────────────────────
+function pickType(type) {
+  state.type = type;
+  typeCards.forEach(c => {
+    const sel = c.dataset.type === type;
+    c.classList.toggle('selected', sel);
+    c.setAttribute('aria-checked', sel);
+  });
+  fileTypeSpan.textContent = type.toUpperCase();
+  nextBtn1.disabled = false;
+}
+
+// ── File ingestion ────────────────────────────────────
+function ingest(incoming) {
+  const valid = incoming.filter(f => {
+    const ext = '.' + f.name.split('.').pop().toLowerCase();
+    return EXT[state.type].includes(ext);
+  });
+
+  if (!valid.length) {
+    log('warn', `No valid .${state.type} files found — try again`);
+    return;
+  }
+
+  state.files = valid;
+  renderFileList();
+  processBtn.disabled = false;
+}
+
+function renderFileList() {
+  fileListEl.innerHTML = '';
+
+  state.files.forEach((f, i) => {
+    const li = document.createElement('li');
+    li.className = 'file-item';
+    li.innerHTML = `
+      <span class="file-item-icon" aria-hidden="true">
+        <i class="fas fa-file-lines"></i>
+      </span>
+      <div class="file-item-info">
+        <div class="file-item-name" title="${escHtml(f.name)}">${escHtml(f.name)}</div>
+        <div class="file-item-size">${fmtSize(f.size)}</div>
+      </div>
+      <button class="file-item-remove" aria-label="Remove ${escHtml(f.name)}" data-index="${i}">
+        <i class="fas fa-xmark" aria-hidden="true"></i>
+      </button>`;
+    fileListEl.appendChild(li);
+  });
+
+  // Delegate removal clicks
+  fileListEl.querySelectorAll('.file-item-remove').forEach(btn => {
+    btn.addEventListener('click', () => removeFile(+btn.dataset.index));
+  });
+
+  filePreview.hidden = state.files.length === 0;
+}
+
+function removeFile(i) {
+  state.files.splice(i, 1);
+  renderFileList();
+  if (!state.files.length) processBtn.disabled = true;
+}
+
+function fmtSize(bytes) {
+  if (bytes === 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / 1024 ** i).toFixed(1) + ' ' + units[i];
+}
+
+function escHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ── Processing pipeline ───────────────────────────────
+async function run() {
+  if (!state.files.length) return;
+  goTo(3);
+
+  try {
+    await upload();
+    await process();
+  } catch (err) {
+    log('error', `Failed — ${err.message}`);
+    console.error(err);
+  }
+}
+
+async function upload() {
+  const fd = new FormData();
+  state.files.forEach(f => fd.append('files', f));
+  fd.append('fileType', state.type);
+
+  log('info', 'Uploading files…');
+  setRing(10, 'Uploading…');
+
+  const res = await fetch('/api/upload', { method: 'POST', body: fd });
+  if (!res.ok) throw new Error(`Upload failed — ${res.statusText}`);
+
+  const data = await res.json();
+  state.session = data.sessionId;
+
+  log('success', `${data.files.length} file${data.files.length !== 1 ? 's' : ''} uploaded`);
+  setRing(25, 'Upload complete');
+}
+
+async function process() {
+  log('info', 'Starting analysis…');
+  setRing(30, 'Analyzing…');
+
+  const es = new EventSource(`/api/process/${state.session}`);
+
+  es.onmessage = e => {
+    const d = JSON.parse(e.data);
+    setRing(d.progress, d.message);
+    log('info', d.message);
+
+    if (d.status === 'complete') {
+      es.close();
+      log('success', 'Analysis complete');
+      setRing(100, 'Done');
+      setTimeout(() => showResults(d.results), 800);
+    } else if (d.status === 'error') {
+      es.close();
+      log('error', d.message);
     }
-    
-    // Store files and update UI
-    uploadedFiles = validFiles;
-    updateFileList();
-    
-    // Enable process button
-    processBtn.disabled = false;
+  };
+
+  es.onerror = () => es.close();
 }
 
-function updateFileList() {
-    fileList.innerHTML = '';
-    
-    uploadedFiles.forEach((file, index) => {
-        const fileItem = document.createElement('div');
-        fileItem.className = 'file-item';
-        fileItem.innerHTML = `
-            <div class="file-icon">📄</div>
-            <div class="file-info">
-                <div class="file-name">${file.name}</div>
-                <div class="file-size">${formatFileSize(file.size)}</div>
-            </div>
-            <button class="remove-file" onclick="removeFile(${index})">&times;</button>
-        `;
-        fileList.appendChild(fileItem);
-    });
-    
-    filePreview.style.display = uploadedFiles.length > 0 ? 'block' : 'none';
+// ── Progress ring ─────────────────────────────────────
+function setRing(pct, text) {
+  const pctRounded = Math.round(pct);
+  const offset = CIRC * (1 - pct / 100);
+
+  ringFill.style.strokeDashoffset = offset;
+  ringPct.textContent = `${pctRounded}%`;
+  progressRing.setAttribute('aria-valuenow', pctRounded);
+
+  if (text) progressText.textContent = text;
 }
 
-function removeFile(index) {
-    uploadedFiles.splice(index, 1);
-    updateFileList();
-    
-    if (uploadedFiles.length === 0) {
-        processBtn.disabled = true;
-    }
+// ── Log stream ────────────────────────────────────────
+function log(type, msg) {
+  const line = document.createElement('div');
+  line.className = 'log-line';
+  line.innerHTML = `<span class="log-dot ${type}" aria-hidden="true"></span><span>${escHtml(msg)}</span>`;
+  logStream.appendChild(line);
+  logStream.scrollTop = logStream.scrollHeight;
+
+  // Keep the log tidy
+  while (logStream.children.length > 10) {
+    logStream.removeChild(logStream.firstChild);
+  }
 }
 
-function formatFileSize(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+// ── Results ───────────────────────────────────────────
+function showResults(r) {
+  const orig    = r.originalShape[0];
+  const cleaned = r.cleanedShape[0];
+  const quality = orig > 0 ? Math.round((cleaned / orig) * 100) : 100;
+
+  $('filesProcessed').textContent = r.filesProcessed;
+  $('issuesFound').textContent    = r.issuesFound;
+  $('dataQuality').textContent    = `${quality}%`;
+  $('rowsProcessed').textContent  = cleaned.toLocaleString();
+  $('previewContent').innerHTML   = `<pre>${escHtml(r.reportPreview)}</pre>`;
+
+  goTo(4);
 }
 
-// Process files
-async function processFiles() {
-    if (uploadedFiles.length === 0) {
-        alert('Please select files to process.');
-        return;
-    }
-    
-    // Go to processing step
-    goToStep(3);
-    
-    try {
-        // Upload files
-        await uploadFiles();
-        
-        // Process data
-        await processData();
-        
-    } catch (error) {
-        console.error('Processing error:', error);
-        showStatusMessage('error', `Processing failed: ${error.message}`);
-    }
-}
-
-async function uploadFiles() {
-    const formData = new FormData();
-    
-    uploadedFiles.forEach(file => {
-        formData.append('files', file);
-    });
-    formData.append('fileType', fileType);
-    
-    showStatusMessage('info', 'Uploading files...');
-    updateProgress(10, 'Uploading files...');
-    
-    const response = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData
-    });
-    
-    if (!response.ok) {
-        throw new Error(`Upload failed: ${response.statusText}`);
-    }
-    
-    const result = await response.json();
-    sessionId = result.sessionId;
-    
-    showStatusMessage('success', `Successfully uploaded ${result.files.length} files`);
-    updateProgress(25, 'Files uploaded successfully');
-}
-
-async function processData() {
-    showStatusMessage('info', 'Starting data analysis...');
-    updateProgress(30, 'Analyzing data quality...');
-    
-    // Use Server-Sent Events for real-time updates
-    const eventSource = new EventSource(`/api/process/${sessionId}`);
-    
-    eventSource.onmessage = function(event) {
-        const data = JSON.parse(event.data);
-        handleProcessingUpdate(data);
-    };
-    
-    eventSource.onerror = function(error) {
-        console.error('SSE Error:', error);
-        eventSource.close();
-    };
-}
-
-function handleProcessingUpdate(data) {
-    updateProgress(data.progress, data.message);
-    showStatusMessage('info', data.message);
-    
-    if (data.status === 'complete') {
-        showStatusMessage('success', 'Processing completed!');
-        updateProgress(100, 'Complete!');
-        setTimeout(() => showResults(data.results), 1000);
-    } else if (data.status === 'error') {
-        showStatusMessage('error', data.message);
-    }
-}
-
-function updateProgress(percent, text) {
-    progressFill.style.width = `${percent}%`;
-    progressText.textContent = text;
-}
-
-function showStatusMessage(type, message) {
-    const messageElement = document.createElement('div');
-    messageElement.className = `status-message ${type}`;
-    messageElement.innerHTML = `
-        <i class="fas fa-${getStatusIcon(type)}"></i>
-        <span>${message}</span>
-    `;
-    
-    statusMessages.appendChild(messageElement);
-    
-    // Scroll to bottom
-    statusMessages.scrollTop = statusMessages.scrollHeight;
-    
-    // Auto-remove old messages
-    if (statusMessages.children.length > 5) {
-        statusMessages.removeChild(statusMessages.firstChild);
-    }
-}
-
-function getStatusIcon(type) {
-    const icons = {
-        'info': 'info-circle',
-        'success': 'check-circle',
-        'error': 'exclamation-circle',
-        'warning': 'exclamation-triangle'
-    };
-    return icons[type] || 'info-circle';
-}
-
-function showResults(results) {
-    // Update statistics
-    document.getElementById('filesProcessed').textContent = results.filesProcessed;
-    document.getElementById('issuesFound').textContent = results.issuesFound;
-    
-    // Calculate data quality percentage
-    const originalRows = results.originalShape[0];
-    const cleanedRows = results.cleanedShape[0];
-    const qualityPercentage = originalRows > 0 ? Math.round((cleanedRows / originalRows) * 100) : 100;
-    document.getElementById('dataQuality').textContent = `${qualityPercentage}%`;
-    document.getElementById('rowsProcessed').textContent = cleanedRows.toLocaleString();
-    
-    // Update preview
-    document.getElementById('previewContent').innerHTML = `<pre>${results.reportPreview}</pre>`;
-    
-    // Go to results step
-    goToStep(4);
-}
-
-// Results actions
+// ── Download ──────────────────────────────────────────
 async function downloadResults() {
-    if (!sessionId) {
-        alert('No session data available.');
-        return;
-    }
-    
-    try {
-        const response = await fetch(`/api/download/${sessionId}`);
-        if (!response.ok) {
-            throw new Error('Download failed');
-        }
-        
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `dsaral_results_${sessionId}.zip`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(url);
-        
-        showStatusMessage('success', 'Download started!');
-    } catch (error) {
-        console.error('Download error:', error);
-        showStatusMessage('error', 'Download failed. Please try again.');
-    }
+  if (!state.session) return;
+
+  try {
+    const res = await fetch(`/api/download/${state.session}`);
+    if (!res.ok) throw new Error(res.statusText);
+
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    const a    = Object.assign(document.createElement('a'), {
+      href: url,
+      download: `dsaral_${state.session}.zip`,
+    });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    log('error', `Download failed — ${err.message}`);
+  }
 }
 
+// ── Report modal ──────────────────────────────────────
 async function viewReport() {
-    if (!sessionId) {
-        alert('No session data available.');
-        return;
-    }
-    
-    try {
-        const response = await fetch(`/api/report/${sessionId}`);
-        if (!response.ok) {
-            throw new Error('Failed to load report');
-        }
-        
-        const data = await response.json();
-        reportContent.textContent = data.report;
-        reportModal.classList.add('show');
-    } catch (error) {
-        console.error('Report error:', error);
-        showStatusMessage('error', 'Failed to load report.');
-    }
+  if (!state.session) return;
+
+  try {
+    const res = await fetch(`/api/report/${state.session}`);
+    if (!res.ok) throw new Error(res.statusText);
+
+    const data = await res.json();
+    reportContent.textContent = data.report;
+    reportModal.hidden = false;
+    modalClose.focus();
+  } catch (err) {
+    log('error', `Could not load report — ${err.message}`);
+  }
 }
 
 function closeModal() {
-    reportModal.classList.remove('show');
+  reportModal.hidden = true;
 }
 
-// Reset wizard
-function resetWizard() {
-    // Reset variables
-    currentStep = 1;
-    sessionId = null;
-    fileType = 'csv';
-    uploadedFiles = [];
-    
-    // Reset UI
-    fileTypeCards.forEach(card => card.classList.remove('selected'));
-    nextBtn1.disabled = true;
-    processBtn.disabled = true;
-    fileInput.value = '';
-    filePreview.style.display = 'none';
-    fileList.innerHTML = '';
-    
-    // Reset progress
-    progressFill.style.width = '0%';
-    progressText.textContent = 'Initializing...';
-    statusMessages.innerHTML = '';
-    
-    // Go to first step
-    goToStep(1);
+// ── Reset ─────────────────────────────────────────────
+function reset() {
+  state = { step: 1, session: null, type: 'csv', files: [] };
+
+  typeCards.forEach(c => { c.classList.remove('selected'); c.setAttribute('aria-checked', 'false'); });
+  nextBtn1.disabled   = true;
+  processBtn.disabled = true;
+  fileInput.value     = '';
+  filePreview.hidden  = true;
+  fileListEl.innerHTML = '';
+  logStream.innerHTML  = '';
+  setRing(0, 'Initializing…');
+
+  goTo(1);
 }
 
-// Cleanup session when leaving page
-window.addEventListener('beforeunload', function() {
-    if (sessionId) {
-        // Clean up server session (best effort)
-        fetch(`/api/cleanup/${sessionId}`, { method: 'DELETE' }).catch(() => {});
-    }
+// ── Cleanup on leave ──────────────────────────────────
+window.addEventListener('beforeunload', () => {
+  if (state.session) {
+    fetch(`/api/cleanup/${state.session}`, { method: 'DELETE' }).catch(() => {});
+  }
 });
