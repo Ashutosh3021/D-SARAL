@@ -600,8 +600,9 @@ class DataProcessingPipeline:
                 continue
 
             if pd.api.types.is_numeric_dtype(df[col]):
-                fv  = df[col].median() if (pct < 0.05 or pct >= 0.30) else df[col].mean()
-                tag = f"{"median" if (pct < 0.05 or pct >= 0.30) else "mean"} ({fv:.4g})"
+                label = "median" if (pct < 0.05 or pct >= 0.30) else "mean"
+                fv    = df[col].median() if (pct < 0.05 or pct >= 0.30) else df[col].mean()
+                tag   = f"{label} ({fv:.4g})"
                 try:
                     df[col] = df[col].astype("float64")
                 except Exception:
