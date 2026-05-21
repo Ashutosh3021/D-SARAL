@@ -351,11 +351,20 @@ class DataProcessingPipeline:
     def analyze_outliers(self, df: pd.DataFrame) -> Dict[str, Any]:
         report: Dict[str, Any] = {}
         for col in df.select_dtypes(include=[np.number]).columns:
-            s = df[col].dropna()
-            if len(s) < 10:
+            if not self._is_outlier_candidate(df[col]):
                 continue
-            z      = np.abs(scipy_stats.zscore(s))
-            q1, q3 = s.quantile(0.25), s.quantile(0.75)
+            arr = self._to_float64_array(df[col])
+            arr = arr[~np.isnan(arr)]
+            if len(arr) < 10:
+                continue
+            s   = pd.Series(arr)
+            std = float(np.nanstd(arr))
+            z   = (
+                np.zeros(len(arr))
+                if std == 0
+                else np.abs(scipy_stats.zscore(arr))
+            )
+            q1, q3 = np.quantile(arr, [0.25, 0.75])
             iqr    = q3 - q1
             lo     = q1 - OUTLIER_IQR_MULTIPLIER * iqr
             hi     = q3 + OUTLIER_IQR_MULTIPLIER * iqr
@@ -709,15 +718,18 @@ class DataProcessingPipeline:
         for col in df.select_dtypes(include=[np.number]).columns:
             if any(kw in col.lower() for kw in _SKIP_OUTLIER_KW):
                 continue
-            q1, q3 = df[col].quantile(0.25), df[col].quantile(0.75)
-            iqr     = q3 - q1
-            if iqr == 0:
+            if not self._is_outlier_candidate(df[col]):
+                continue
+            nums = pd.to_numeric(df[col], errors="coerce")
+            q1, q3 = nums.quantile(0.25), nums.quantile(0.75)
+            iqr    = q3 - q1
+            if iqr == 0 or pd.isna(iqr):
                 continue
             lo = q1 - OUTLIER_IQR_MULTIPLIER * iqr
             hi = q3 + OUTLIER_IQR_MULTIPLIER * iqr
-            n  = int(((df[col] < lo) | (df[col] > hi)).sum())
+            n  = int(((nums < lo) | (nums > hi)).sum())
             if n:
-                df[col] = df[col].clip(lower=lo, upper=hi)
+                df[col] = nums.clip(lower=lo, upper=hi)
                 caps[col] = {"capped": n, "lo": round(lo, 4), "hi": round(hi, 4)}
 
         self.cleaning_log.append({"step": "fix_broken_entries::outlier_caps", "details": caps})
@@ -815,6 +827,8 @@ class DataProcessingPipeline:
 
         # Final type enforcement
         for col in df.select_dtypes(include=[np.number]).columns:
+            if not self._is_outlier_candidate(df[col]):
+                continue
             s = df[col].dropna()
             if len(s) and s.apply(lambda x: float(x).is_integer()).all():
                 try:
@@ -1087,6 +1101,22 @@ class DataProcessingPipeline:
     # ──────────────────────────────────────────────────────────────────────────
     # Internal helpers
     # ──────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _to_float64_array(series: pd.Series) -> np.ndarray:
+        """Coerce to float64 for scipy/numpy ufuncs (avoids object-dtype sqrt errors)."""
+        return pd.to_numeric(series, errors="coerce").to_numpy(
+            dtype=np.float64, na_value=np.nan
+        )
+
+    @staticmethod
+    def _is_outlier_candidate(series: pd.Series) -> bool:
+        """Exclude bool/timedelta columns that select_dtypes(np.number) still matches."""
+        return not (
+            pd.api.types.is_bool_dtype(series)
+            or pd.api.types.is_timedelta64_dtype(series)
+            or pd.api.types.is_datetime64_any_dtype(series)
+        )
 
     def _recheck(self, df: pd.DataFrame, step: str, orig_shape, msg: str) -> None:
         """
