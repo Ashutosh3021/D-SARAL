@@ -223,7 +223,10 @@ async function process() {
       es.close();
       log('success', 'Analysis complete');
       setRing(100, 'Done');
-      setTimeout(() => showResults(d.results), 800);
+      setTimeout(() => {
+        try { showResults(d.results); }
+        catch (err) { log('error', `Display error — ${err.message}`); }
+      }, 800);
     } else if (d.status === 'error') {
       es.close();
       log('error', d.message);

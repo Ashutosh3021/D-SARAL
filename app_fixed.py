@@ -105,7 +105,7 @@ def _build_summary(pipeline: DataProcessingPipeline,
         "reportPreview":    report[:600] + "…" if len(report) > 600 else report,
         "cleaningSteps":    [
             e["message"] for e in pipeline.cleaning_log
-            if e.get("step", "").startswith("step_")
+            if e.get("step", "").startswith("step_") and "message" in e
         ],
     }
 
