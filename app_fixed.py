@@ -59,9 +59,20 @@ def _allowed(filename: str) -> bool:
     return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXT
 
 
+def _sanitize_for_json(obj):
+    """Recursively stringify dict keys so json.dump/json.dumps never see dtype objects."""
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
 def _sse(data: dict) -> str:
     """Format a dict as a Server-Sent Event string."""
-    return f"data: {json.dumps(data, default=str)}\n\n"
+    return f"data: {json.dumps(_sanitize_for_json(data), default=str)}\n\n"
 
 
 def _count_issues(analysis: dict) -> int:
@@ -237,10 +248,10 @@ def process_data(session_id):
                 fh.write(report)
 
             with open(os.path.join(session_out, "cleaning_log.json"), "w") as fh:
-                json.dump(pipeline.cleaning_log, fh, indent=2, default=str)
+                json.dump(_sanitize_for_json(pipeline.cleaning_log), fh, indent=2, default=str)
 
             with open(os.path.join(session_out, "analysis_summary.json"), "w") as fh:
-                json.dump(analysis, fh, indent=2, default=str)
+                json.dump(_sanitize_for_json(analysis), fh, indent=2, default=str)
 
             # ── Complete ──────────────────────────────────────────────────
             summary = _build_summary(

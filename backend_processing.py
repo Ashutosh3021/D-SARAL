@@ -167,7 +167,7 @@ class DataProcessingPipeline:
             "total_cells":   int(df.shape[0] * df.shape[1]),
             "memory_mb":     round(df.memory_usage(deep=True).sum() / 1024 / 1024, 3),
             "dtypes":        {c: str(t) for c, t in df.dtypes.items()},
-            "dtype_summary": df.dtypes.value_counts().to_dict(),
+            "dtype_summary": self._dtype_counts_dict(df),
         }
 
         # ── head_tail ────────────────────────────────────────────────────────
@@ -1118,6 +1118,11 @@ class DataProcessingPipeline:
             or pd.api.types.is_datetime64_any_dtype(series)
         )
 
+    @staticmethod
+    def _dtype_counts_dict(df: pd.DataFrame) -> Dict[str, int]:
+        """JSON-safe dtype histogram (keys must be str, not numpy/pandas dtype objects)."""
+        return {str(dtype): int(count) for dtype, count in df.dtypes.value_counts().items()}
+
     def _recheck(self, df: pd.DataFrame, step: str, orig_shape, msg: str) -> None:
         """
         DIAGRAM NODE: Re-check Statistics after each incremental step.
@@ -1129,7 +1134,7 @@ class DataProcessingPipeline:
             "original_shape": list(orig_shape),
             "current_shape":  list(df.shape),
             "missing_cells":  n_missing,
-            "dtype_counts":   df.dtypes.value_counts().to_dict(),
+            "dtype_counts":   self._dtype_counts_dict(df),
             "message":        msg,
             "timestamp":      datetime.now().isoformat(),
         }
